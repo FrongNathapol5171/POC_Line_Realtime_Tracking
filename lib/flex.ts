@@ -108,7 +108,7 @@ export function buildRoadmapFlex(patient: Patient, clinics: Clinic[]): FlexMessa
             color: '#22394d',
             action: {
               type: 'postback',
-              label: 'Need Help',
+              label: 'ขอความช่วยเหลือ',
               data: `action=help&hn=${hn}`,
               displayText: 'Need Help / ขอความช่วยเหลือ',
             },

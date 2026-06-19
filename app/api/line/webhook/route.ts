@@ -155,21 +155,31 @@ async function handleBindingMessage(event: LineEvent) {
     return
   }
 
-  // Append event (fire-and-forget — non-critical for data integrity)
-  void appendEvent({ eventId: crypto.randomUUID(), hn, clinicId: firstClinicId, type: 'BOUND', timestamp: now })
-    .catch(err => void writeLog({ type: 'BINDING_ERROR', step: 'append_event', status: 'ERROR', hn, detail: String(err) }))
+  // ── Parallel: fetch clinics + append event at the same time ────────
+  // getClinics() is served from cache after first call (~0ms warm)
+  let clinics: Awaited<ReturnType<typeof getClinics>>
+  try {
+    const [fetchedClinics] = await Promise.all([
+      getClinics(),
+      // appendEvent is non-critical — run in parallel, errors are logged
+      appendEvent({ eventId: crypto.randomUUID(), hn, clinicId: firstClinicId, type: 'BOUND', timestamp: now })
+        .catch(err => writeLog({ type: 'BINDING_ERROR', step: 'append_event', status: 'ERROR', hn, detail: String(err) })),
+    ])
+    clinics = fetchedClinics
+  } catch (err) {
+    void writeLog({ type: 'BINDING_ERROR', step: 'get_clinics', status: 'ERROR', hn, detail: String(err) })
+    return   // can't push roadmap without clinics
+  }
 
-  // ── Flex push (fire-and-forget — after 200 response) ─────────────
-  void (async () => {
-    try {
-      const clinics = await getClinics()
-      const pushResult = await pushRoadmap(lineUserId, patient, clinics)
-      void writeLog({ type: 'LINE_PUSH_SUCCESS', step: 'push_roadmap', status: 'OK', hn, detail: `HTTP ${pushResult.status}` })
-    } catch (err) {
-      void writeLog({ type: 'LINE_PUSH_FAILED', step: 'push_roadmap', status: 'ERROR', hn, detail: String(err) })
-      void safePushText(lineUserId, `Linked! (HN: ${hn}) — Journey started. Ask staff if the roadmap doesn't appear.`)
-    }
-  })()
+  // ── Push Flex roadmap — AWAITED so it always completes ──────────────
+  try {
+    const pushResult = await pushRoadmap(lineUserId, patient, clinics)
+    void writeLog({ type: 'LINE_PUSH_SUCCESS', step: 'push_roadmap', status: 'OK', hn, detail: `HTTP ${pushResult.status}` })
+  } catch (err) {
+    void writeLog({ type: 'LINE_PUSH_FAILED', step: 'push_roadmap', status: 'ERROR', hn, detail: String(err) })
+    // Push failed — log only, no text fallback (avoids confusion of seeing
+    // text msg before flex, making user think they need to send again)
+  }
 }
 
 // ---------------------------------------------------------------------------

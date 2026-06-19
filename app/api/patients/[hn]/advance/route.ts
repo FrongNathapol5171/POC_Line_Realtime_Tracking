@@ -33,49 +33,58 @@ export async function POST(
   const isFinished = patient.currentIndex >= sequence.length
 
   if (isFinished) {
-    // ── Journey complete ──────────────────────────────────────
+    // ── Journey complete ──────────────────────────────────────────
     patient.status = 'COMPLETED'
 
-    // 1. Log COMPLETED event + push LINE + archive — all in parallel
-    await Promise.all([
-      appendEvent({ eventId: crypto.randomUUID(), hn, clinicId, type: 'COMPLETED', timestamp: now }),
-      patient.lineUserId
-        ? pushCompletion(patient.lineUserId, hn).catch(async err => {
-            await writeLog({ type: 'LINE_PUSH_FAILED', step: 'completion_flex', status: 'ERROR', hn, detail: String(err) })
-          })
-        : Promise.resolve(),
-    ])
+    // Append completed event
+    void appendEvent({ eventId: crypto.randomUUID(), hn, clinicId, type: 'COMPLETED', timestamp: now })
 
-    // 2. Archive: copy to PatientHistory → delete from Patients
+    // Push completion Flex — awaited so it reliably delivers
+    if (patient.lineUserId) {
+      try {
+        await pushCompletion(patient.lineUserId, hn)
+        void writeLog({ type: 'LINE_PUSH_SUCCESS', step: 'completion_flex', status: 'OK', hn })
+      } catch (err) {
+        void writeLog({ type: 'LINE_PUSH_FAILED', step: 'completion_flex', status: 'ERROR', hn, detail: String(err) })
+      }
+    }
+
+    // Archive: copy to PatientHistory → delete from Patients
     try {
       await archivePatient(patient)
-      await writeLog({ type: 'PATIENT_ARCHIVED', step: 'archive', status: 'OK', hn, detail: 'Moved to PatientHistory' })
+      void writeLog({ type: 'PATIENT_ARCHIVED', step: 'archive', status: 'OK', hn })
     } catch (err) {
-      // If archive fails, fall back to just updating status in-place so we don't lose data
-      await writeLog({ type: 'ARCHIVE_ERROR', step: 'archive', status: 'ERROR', hn, detail: String(err) })
-      await upsertPatient(patient)
+      void writeLog({ type: 'ARCHIVE_ERROR', step: 'archive', status: 'ERROR', hn, detail: String(err) })
+      await upsertPatient(patient)   // fallback: at least update status
     }
   } else {
-    // ── Advance to next clinic ────────────────────────────────
+    // ── Advance to next clinic ────────────────────────────────────
     patient.status = 'IN_PROGRESS'
     const nextClinic = sequence[patient.currentIndex]
 
-    // Parallelize: save patient + log both events + fetch clinics
-    const [, , clinics] = await Promise.all([
+    // Save patient + log events in parallel
+    await Promise.all([
       upsertPatient(patient),
-      Promise.all([
-        appendEvent({ eventId: crypto.randomUUID(), hn, clinicId, type: 'COMPLETED', timestamp: now }),
-        appendEvent({ eventId: crypto.randomUUID(), hn, clinicId: nextClinic, type: 'ARRIVED', timestamp: now }),
-      ]),
-      patient.lineUserId ? getClinics() : Promise.resolve(null),
+      appendEvent({ eventId: crypto.randomUUID(), hn, clinicId,   type: 'COMPLETED', timestamp: now }),
+      appendEvent({ eventId: crypto.randomUUID(), hn, clinicId: nextClinic, type: 'ARRIVED', timestamp: now }),
     ])
 
-    if (patient.lineUserId && clinics) {
-      pushRoadmap(patient.lineUserId, patient, clinics).catch(async err => {
-        await writeLog({ type: 'LINE_PUSH_FAILED', step: 'advance_roadmap', status: 'ERROR', hn, detail: String(err) })
-      })
+    // Push updated roadmap Flex — awaited
+    if (patient.lineUserId) {
+      try {
+        const clinics = await getClinics()   // served from cache after first load
+        await pushRoadmap(patient.lineUserId, patient, clinics)
+        void writeLog({ type: 'LINE_PUSH_SUCCESS', step: 'advance_roadmap', status: 'OK', hn })
+      } catch (err) {
+        void writeLog({ type: 'LINE_PUSH_FAILED', step: 'advance_roadmap', status: 'ERROR', hn, detail: String(err) })
+      }
     }
   }
 
-  return NextResponse.json({ success: true, status: patient.status, currentIndex: patient.currentIndex, archived: isFinished })
+  return NextResponse.json({
+    success: true,
+    status: patient.status,
+    currentIndex: patient.currentIndex,
+    archived: isFinished,
+  })
 }
