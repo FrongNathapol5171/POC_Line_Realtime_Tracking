@@ -14,16 +14,20 @@ import { writeLog } from '@/lib/logger'
 export const dynamic = 'force-dynamic'
 
 // ---------------------------------------------------------------------------
-// Entry point — LINE calls this on every chat event
+// Entry point
+// Strategy:
+//   • Respond 200 as fast as possible (LINE requires < 1s)
+//   • CRITICAL writes (lineUserId update) → awaited BEFORE responding
+//   • LINE push (Flex message) → fire-and-forget AFTER responding
 // ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
   const rawBody = await req.text()
   const signature = req.headers.get('x-line-signature') ?? ''
 
-  // 1. Verify LINE signature
+  // Verify signature
   if (!validateLineSignature(rawBody, signature)) {
-    await writeLog({ type: 'WEBHOOK_ERROR', step: 'signature_check', status: 'ERROR', detail: 'Invalid x-line-signature' })
+    void writeLog({ type: 'WEBHOOK_ERROR', step: 'signature_check', status: 'ERROR', detail: 'Invalid x-line-signature' })
     return NextResponse.json({ error: 'Invalid signature' }, { status: 400 })
   }
 
@@ -31,33 +35,29 @@ export async function POST(req: NextRequest) {
   try {
     body = JSON.parse(rawBody)
   } catch {
-    await writeLog({ type: 'WEBHOOK_ERROR', step: 'parse_body', status: 'ERROR', detail: 'Could not parse JSON body' })
     return NextResponse.json({ error: 'Bad JSON' }, { status: 400 })
   }
 
   const events: LineEvent[] = body.events ?? []
 
-  await writeLog({
-    type: 'WEBHOOK_RECEIVED',
-    step: 'received',
-    status: 'INFO',
-    detail: `${events.length} event(s) — types: ${events.map(e => e.type).join(', ')}`,
+  // Log receipt (fire-and-forget — don't await, keep response fast)
+  void writeLog({
+    type: 'WEBHOOK_RECEIVED', step: 'received', status: 'INFO',
+    detail: `${events.length} event(s): ${events.map(e => e.type).join(', ')}`,
   })
 
-  // 2. Respond 200 immediately (LINE times out after ~1s)
-  //    Process events async — but now every step is logged to Sheets
-  processEvents(events).catch(async (err) => {
-    await writeLog({
-      type: 'PROCESS_ERROR', step: 'processEvents', status: 'ERROR',
-      detail: String(err),
-    })
-  })
+  // Process synchronously so sheet writes complete before response.
+  // LINE push is done inside as fire-and-forget (non-blocking).
+  try {
+    await processEvents(events)
+  } catch (err) {
+    void writeLog({ type: 'PROCESS_ERROR', step: 'processEvents', status: 'ERROR', detail: String(err) })
+    // Still return 200 so LINE doesn't retry (idempotency handles duplicates)
+  }
 
   return NextResponse.json({ ok: true })
 }
 
-// ---------------------------------------------------------------------------
-// Types
 // ---------------------------------------------------------------------------
 
 type LineEvent = {
@@ -68,167 +68,151 @@ type LineEvent = {
   postback?: { data: string }
 }
 
-// ---------------------------------------------------------------------------
-// Event router
-// ---------------------------------------------------------------------------
-
 async function processEvents(events: LineEvent[]) {
   for (const event of events) {
     if (event.type === 'message' && event.message?.type === 'text') {
       await handleBindingMessage(event)
     } else if (event.type === 'postback') {
       await handlePostback(event)
-    } else {
-      await writeLog({
-        type: 'WEBHOOK_SKIP', step: 'event_type', status: 'INFO',
-        detail: `Ignored event type: ${event.type}`,
-      })
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Binding: patient sends the pre-filled message from scanning the QR
+// Binding — patient sends pre-filled message after scanning QR
 // ---------------------------------------------------------------------------
 
 async function handleBindingMessage(event: LineEvent) {
-  const text = event.message?.text ?? ''
+  const rawText   = event.message?.text ?? ''
   const lineUserId = event.source.userId
   const replyToken = event.replyToken ?? ''
 
-  await writeLog({
+  // Normalise: collapse whitespace, trim
+  const text = rawText.replace(/\s+/g, ' ').trim()
+
+  void writeLog({
     type: 'BINDING_ATTEMPT', step: 'parse_message', status: 'INFO',
-    detail: `userId=${lineUserId} | text="${text.slice(0, 120)}"`,
+    detail: `userId=${lineUserId} text="${text.slice(0, 150)}"`,
   })
 
-  // Parse "HN: XXX | TOKEN: yyy" from message
-  const tokenMatch = text.match(/TOKEN:\s*([a-f0-9-]{36})/i)
-  const hnMatch    = text.match(/HN:\s*([^\s|]+)/i)
+  // Permissive UUID regex — allows any case, trims surrounding whitespace
+  const tokenMatch = text.match(/TOKEN\s*:\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/i)
+  const hnMatch    = text.match(/HN\s*:\s*([^\s|]+)/i)
 
   if (!tokenMatch || !hnMatch) {
-    await writeLog({
+    void writeLog({
       type: 'BINDING_SKIP', step: 'parse_message', status: 'WARN',
-      detail: `No HN/TOKEN pattern in message. text="${text.slice(0, 200)}"`,
+      detail: `No HN/TOKEN pattern. text="${text.slice(0, 200)}"`,
     })
-    return   // not a binding message — ignore silently
+    return
   }
 
-  const token = tokenMatch[1].trim()
+  const token = tokenMatch[1].trim().toLowerCase()
   const hn    = hnMatch[1].trim()
 
-  await writeLog({ type: 'BINDING_ATTEMPT', step: 'token_extracted', status: 'INFO', hn, detail: `token=${token}` })
+  void writeLog({ type: 'BINDING_ATTEMPT', step: 'token_extracted', status: 'INFO', hn, detail: `token=${token}` })
 
-  // Lookup patient by token
+  // ── Token lookup (must succeed before sheet write) ───────────────
   let result: Awaited<ReturnType<typeof getPatientByToken>>
   try {
     result = await getPatientByToken(token)
   } catch (err) {
-    await writeLog({ type: 'BINDING_ERROR', step: 'getPatientByToken', status: 'ERROR', hn, detail: String(err) })
-    await safePushText(lineUserId, 'System error — please contact staff. (DB lookup failed)')
+    void writeLog({ type: 'BINDING_ERROR', step: 'getPatientByToken', status: 'ERROR', hn, detail: String(err) })
+    void safePushText(lineUserId, 'System error during lookup — please contact staff.')
     return
   }
 
   if (!result) {
-    await writeLog({ type: 'BINDING_ERROR', step: 'token_lookup', status: 'WARN', hn, detail: `Token not found: ${token}` })
-    await safePushText(lineUserId, `Registration not found (HN: ${hn}). Please contact staff.`)
+    void writeLog({ type: 'BINDING_ERROR', step: 'token_lookup', status: 'WARN', hn, detail: `Token not found: ${token}` })
+    void safePushText(lineUserId, `Registration not found (HN: ${hn}). Please contact staff. / ไม่พบข้อมูล`)
     return
   }
 
-  const { patient } = result
+  const { patient, rowIndex } = result
 
-  // Already bound — idempotent
+  // Idempotent — already bound
   if (patient.bindTokenUsed) {
-    await writeLog({ type: 'BINDING_SKIP', step: 'already_bound', status: 'WARN', hn, detail: `lineUserId already=${patient.lineUserId}` })
-    await safePushText(lineUserId, 'This account is already linked. / บัญชีนี้เชื่อมต่อแล้ว')
+    void writeLog({ type: 'BINDING_SKIP', step: 'already_bound', status: 'WARN', hn, detail: `lineUserId=${patient.lineUserId}` })
+    void safePushText(lineUserId, 'Account already linked. / บัญชีนี้เชื่อมต่อแล้ว')
     return
   }
 
-  // Bind: update patient record
+  // ── CRITICAL: write lineUserId to sheet (awaited — must complete) ──
   const now = new Date().toISOString()
   patient.lineUserId    = lineUserId
   patient.bindTokenUsed = true
   patient.status        = 'BOUND'
   patient.updatedAt     = now
-
   const firstClinicId = (JSON.parse(patient.sequenceJson) as string[])[0] ?? ''
 
-  // ── PARALLEL: direct row update (no re-read) + log event + cached clinics ──
-  // updatePatientAtRow uses the rowIndex already known from getPatientByToken.
-  // This skips a full sheet re-read that upsertPatient() would trigger.
-  let clinics: Awaited<ReturnType<typeof getClinics>>
   try {
-    const [, , fetchedClinics] = await Promise.all([
-      updatePatientAtRow(result.rowIndex, patient),   // direct write — no extra read
-      appendEvent({ eventId: crypto.randomUUID(), hn, clinicId: firstClinicId, type: 'BOUND', timestamp: now }),
-      getClinics(),                                    // served from cache if warm
-    ])
-    clinics = fetchedClinics
-    await writeLog({ type: 'BINDING_SUCCESS', step: 'parallel_save+clinics', status: 'OK', hn, detail: `${clinics.length} clinics, lineUserId=${lineUserId}` })
+    // updatePatientAtRow uses known rowIndex — no extra sheet read needed
+    await updatePatientAtRow(rowIndex, patient)
+    void writeLog({ type: 'BINDING_SUCCESS', step: 'sheet_update', status: 'OK', hn, detail: `lineUserId=${lineUserId} row=${rowIndex}` })
   } catch (err) {
-    await writeLog({ type: 'BINDING_ERROR', step: 'parallel_save+clinics', status: 'ERROR', hn, detail: String(err) })
-    await safePushText(lineUserId, 'System error — binding may have failed. Please contact staff.')
+    void writeLog({ type: 'BINDING_ERROR', step: 'sheet_update', status: 'ERROR', hn, detail: String(err) })
+    void safePushText(lineUserId, 'System error saving your data — please try again or contact staff.')
     return
   }
 
-  // Push roadmap Flex message
-  try {
-    const pushResult = await pushRoadmap(lineUserId, patient, clinics)
-    await writeLog({
-      type: 'LINE_PUSH_SUCCESS', step: 'push_roadmap', status: 'OK', hn,
-      detail: `HTTP ${pushResult.status}`,
-    })
-  } catch (err) {
-    await writeLog({ type: 'LINE_PUSH_FAILED', step: 'push_roadmap', status: 'ERROR', hn, detail: String(err) })
-    // Binding is saved — patient IS bound even if Flex failed
-    await safePushText(lineUserId, `Linked! (HN: ${hn}) — Your journey has started. Ask staff for the clinic roadmap if it does not appear.`)
-  }
+  // Append event (fire-and-forget — non-critical for data integrity)
+  void appendEvent({ eventId: crypto.randomUUID(), hn, clinicId: firstClinicId, type: 'BOUND', timestamp: now })
+    .catch(err => void writeLog({ type: 'BINDING_ERROR', step: 'append_event', status: 'ERROR', hn, detail: String(err) }))
+
+  // ── Flex push (fire-and-forget — after 200 response) ─────────────
+  void (async () => {
+    try {
+      const clinics = await getClinics()
+      const pushResult = await pushRoadmap(lineUserId, patient, clinics)
+      void writeLog({ type: 'LINE_PUSH_SUCCESS', step: 'push_roadmap', status: 'OK', hn, detail: `HTTP ${pushResult.status}` })
+    } catch (err) {
+      void writeLog({ type: 'LINE_PUSH_FAILED', step: 'push_roadmap', status: 'ERROR', hn, detail: String(err) })
+      void safePushText(lineUserId, `Linked! (HN: ${hn}) — Journey started. Ask staff if the roadmap doesn't appear.`)
+    }
+  })()
 }
 
 // ---------------------------------------------------------------------------
-// Postback: "Need Help" button in Flex message
+// Postback — "Need Help" button
 // ---------------------------------------------------------------------------
 
 async function handlePostback(event: LineEvent) {
-  const data      = event.postback?.data ?? ''
-  const lineUserId = event.source.userId
-  const replyToken = event.replyToken ?? ''
+  const data       = event.postback?.data ?? ''
+  const lineUserId  = event.source.userId
+  const replyToken  = event.replyToken ?? ''
 
   const params = new URLSearchParams(data)
   const action = params.get('action')
   const hn     = params.get('hn') ?? ''
 
-  await writeLog({ type: 'POSTBACK', step: 'received', status: 'INFO', hn, detail: `action=${action}` })
-
   if (action !== 'help' || !hn) return
 
   try {
     const patient = await getPatient(hn)
-    if (!patient) {
-      await writeLog({ type: 'POSTBACK_ERROR', step: 'get_patient', status: 'WARN', hn, detail: 'Patient not found' })
-      return
-    }
+    if (!patient) return
 
     const now = new Date().toISOString()
     patient.needHelp  = true
     patient.updatedAt = now
     await upsertPatient(patient)
 
-    const seq            = JSON.parse(patient.sequenceJson || '[]') as string[]
+    const seq             = JSON.parse(patient.sequenceJson || '[]') as string[]
     const currentClinicId = seq[patient.currentIndex] ?? ''
 
-    await appendHelpRequest({ helpId: crypto.randomUUID(), hn, clinicId: currentClinicId, status: 'OPEN', createdAt: now, resolvedAt: '' })
-    await appendEvent({ eventId: crypto.randomUUID(), hn, clinicId: currentClinicId, type: 'HELP_REQUESTED', timestamp: now })
+    await Promise.all([
+      appendHelpRequest({ helpId: crypto.randomUUID(), hn, clinicId: currentClinicId, status: 'OPEN', createdAt: now, resolvedAt: '' }),
+      appendEvent({ eventId: crypto.randomUUID(), hn, clinicId: currentClinicId, type: 'HELP_REQUESTED', timestamp: now }),
+    ])
 
-    await writeLog({ type: 'HELP_LOGGED', step: 'postback_help', status: 'OK', hn, detail: `clinic=${currentClinicId}` })
+    void writeLog({ type: 'HELP_LOGGED', step: 'postback_help', status: 'OK', hn })
 
     try {
-      await replyText(replyToken, 'Help is on the way. Staff have been notified. / เจ้าหน้าที่รับทราบแล้ว กรุณารอสักครู่')
-      await writeLog({ type: 'LINE_REPLY_SUCCESS', step: 'reply_help_ack', status: 'OK', hn })
+      await replyText(replyToken, 'Help is on the way. / เจ้าหน้าที่รับทราบแล้ว กรุณารอสักครู่')
     } catch (err) {
-      await writeLog({ type: 'LINE_REPLY_FAILED', step: 'reply_help_ack', status: 'ERROR', hn, detail: String(err) })
+      void writeLog({ type: 'LINE_REPLY_FAILED', step: 'reply_help', status: 'ERROR', hn, detail: String(err) })
     }
   } catch (err) {
-    await writeLog({ type: 'POSTBACK_ERROR', step: 'handle_help', status: 'ERROR', hn, detail: String(err) })
+    void writeLog({ type: 'POSTBACK_ERROR', step: 'handle_help', status: 'ERROR', hn, detail: String(err) })
   }
 }
 
@@ -236,12 +220,10 @@ async function handlePostback(event: LineEvent) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Push a plain-text fallback — logs but never throws */
 async function safePushText(lineUserId: string, text: string) {
   try {
     await pushText(lineUserId, text)
-    await writeLog({ type: 'LINE_PUSH_SUCCESS', step: 'safe_push_text', status: 'OK', detail: `to=${lineUserId}` })
   } catch (err) {
-    await writeLog({ type: 'LINE_PUSH_FAILED', step: 'safe_push_text', status: 'ERROR', detail: String(err) })
+    void writeLog({ type: 'LINE_PUSH_FAILED', step: 'safe_push_text', status: 'ERROR', detail: String(err) })
   }
 }

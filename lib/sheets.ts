@@ -125,8 +125,10 @@ export async function getPatient(hn: string): Promise<Patient | null> {
 
 export async function getPatientByToken(token: string): Promise<{ patient: Patient; rowIndex: number } | null> {
   const rows = await getSheetValues('Patients')
+  const normalised = token.trim().toLowerCase()
   for (let i = 1; i < rows.length; i++) {
-    if (rows[i][2] === token) return { patient: rowToPatient(rows[i]), rowIndex: i + 1 }
+    const stored = (rows[i][2] ?? '').trim().toLowerCase()
+    if (stored === normalised) return { patient: rowToPatient(rows[i]), rowIndex: i + 1 }
   }
   return null
 }

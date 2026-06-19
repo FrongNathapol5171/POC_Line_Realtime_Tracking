@@ -4,7 +4,7 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
   Activity, ClipboardPlus, Stethoscope,
-  Building2, LayoutDashboard, Settings, HelpCircle, UserCog,
+  Building2, LayoutDashboard, UserCog,
   Users, ScrollText, History,
 } from 'lucide-react'
 
@@ -76,19 +76,6 @@ export default function Nav() {
             </Link>
           )
         })}
-      </div>
-
-      {/* Settings (static, non-navigable) */}
-      <span className="sidebar-section" style={{ marginTop: 24 }}>Settings</span>
-      <div className="space-y-0.5 px-1">
-        {[{ Icon: Settings, label: 'App Settings' }, { Icon: HelpCircle, label: 'Help & Support' }].map(({ Icon, label }) => (
-          <div key={label} className="nav-item cursor-default">
-            <div className="w-8 h-8 rounded-xl flex items-center justify-center bg-gray-50 flex-shrink-0">
-              <Icon size={15} strokeWidth={2.2} className="text-gray-300" />
-            </div>
-            {label}
-          </div>
-        ))}
       </div>
 
       {/* Push everything else to the bottom */}
