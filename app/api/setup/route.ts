@@ -25,6 +25,16 @@ const TABS = [
     headers: ['helpId','hn','clinicId','status','createdAt','resolvedAt'],
     seed: null,
   },
+  {
+    name: 'Logs',
+    headers: ['logId','timestamp','type','hn','step','status','detail'],
+    seed: null,
+  },
+  {
+    name: 'PatientHistory',
+    headers: ['hn','lineUserId','bindToken','bindTokenUsed','sequenceJson','currentIndex','status','needHelp','createdAt','updatedAt','completedAt'],
+    seed: null,
+  },
 ]
 
 function getAuth() {

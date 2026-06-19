@@ -8,21 +8,30 @@ import {
   EventType,
   DashboardData,
 } from './types'
+import { getCachedClinics, setCachedClinics, invalidateClinics, getCachedSheetId, setCachedSheetId } from './cache'
 
 // ---------------------------------------------------------------------------
-// Auth
+// Auth — cached per process to avoid recreating JWT on every call
 // ---------------------------------------------------------------------------
+
+let _authClient: InstanceType<typeof google.auth.JWT> | null = null
 
 function getAuth() {
+  if (_authClient) return _authClient
   const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL!
   const key = (process.env.GOOGLE_PRIVATE_KEY ?? '').replace(/\\n/g, '\n')
-  return new google.auth.JWT(email, undefined, key, [
+  _authClient = new google.auth.JWT(email, undefined, key, [
     'https://www.googleapis.com/auth/spreadsheets',
   ])
+  return _authClient
 }
 
+let _sheetsClient: ReturnType<typeof google.sheets> | null = null
+
 function getSheets() {
-  return google.sheets({ version: 'v4', auth: getAuth() })
+  if (_sheetsClient) return _sheetsClient
+  _sheetsClient = google.sheets({ version: 'v4', auth: getAuth() })
+  return _sheetsClient
 }
 
 const SHEET_ID = () => process.env.GOOGLE_SHEET_ID!
@@ -122,6 +131,14 @@ export async function getPatientByToken(token: string): Promise<{ patient: Patie
   return null
 }
 
+/**
+ * Update a patient row directly by its known 1-based row index.
+ * Faster than upsertPatient() because it skips re-reading the whole sheet.
+ */
+export async function updatePatientAtRow(rowIndex: number, patient: Patient): Promise<void> {
+  await updateRow('Patients', rowIndex, patientToRow(patient))
+}
+
 export async function upsertPatient(patient: Patient): Promise<void> {
   const rows = await getSheetValues('Patients')
   if (rows.length === 0) {
@@ -186,6 +203,10 @@ function clinicToRow(c: Clinic): string[] {
 }
 
 export async function getClinics(): Promise<Clinic[]> {
+  // Check in-memory cache first (saves ~500ms Sheets API call)
+  const cached = getCachedClinics()
+  if (cached) return cached
+
   const rows = await getSheetValues('Clinics')
   if (rows.length <= 1) await seedBilling(rows.length === 0)
   const freshRows = rows.length > 1 ? rows : await getSheetValues('Clinics')
@@ -195,7 +216,9 @@ export async function getClinics(): Promise<Clinic[]> {
     await appendRow('Clinics', clinicToRow(BILLING_SEED))
     clinics.push(BILLING_SEED)
   }
-  return clinics.sort((a, b) => a.displayOrder - b.displayOrder)
+  const sorted = clinics.sort((a, b) => a.displayOrder - b.displayOrder)
+  setCachedClinics(sorted)
+  return sorted
 }
 
 async function seedBilling(needsHeader: boolean) {
@@ -204,6 +227,7 @@ async function seedBilling(needsHeader: boolean) {
 }
 
 export async function upsertClinic(clinic: Clinic): Promise<void> {
+  invalidateClinics()   // force cache refresh on next getClinics() call
   const rows = await getSheetValues('Clinics')
   if (rows.length === 0) {
     await appendRow('Clinics', C_HEADERS)
@@ -427,3 +451,78 @@ export async function getDashboardData(): Promise<DashboardData> {
     completedToday,
   }
 }
+
+// ---------------------------------------------------------------------------
+// PatientHistory tab — archived completed patients
+// Columns: same as Patients + completedAt
+// ---------------------------------------------------------------------------
+
+const PH_HEADERS = [
+  'hn','lineUserId','bindToken','bindTokenUsed','sequenceJson',
+  'currentIndex','status','needHelp','createdAt','updatedAt','completedAt',
+]
+
+export interface PatientHistoryRow extends Patient { completedAt: string }
+
+function rowToHistory(row: string[]): PatientHistoryRow {
+  return {
+    ...rowToPatient(row),
+    completedAt: row[10] ?? '',
+  }
+}
+
+export async function archivePatient(patient: Patient): Promise<void> {
+  const completedAt = new Date().toISOString()
+  // Ensure PatientHistory has headers
+  const hRows = await getSheetValues('PatientHistory')
+  if (!hRows.length) await appendRow('PatientHistory', PH_HEADERS)
+
+  // Append to PatientHistory
+  await appendRow('PatientHistory', [...patientToRow(patient), completedAt])
+
+  // Delete from active Patients sheet
+  await deletePatientRow(patient.hn)
+}
+
+async function getNumericSheetId(tabName: string): Promise<number> {
+  const cached = getCachedSheetId(tabName)
+  if (cached !== null) return cached
+
+  const sheets = getSheets()
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID() })
+  const sheet = meta.data.sheets?.find(s => s.properties?.title === tabName)
+  if (!sheet?.properties?.sheetId) throw new Error(`Sheet "${tabName}" not found`)
+  const id = sheet.properties.sheetId
+  setCachedSheetId(tabName, id)
+  return id
+}
+
+export async function deletePatientRow(hn: string): Promise<void> {
+  const rows = await getSheetValues('Patients')
+  const rowIndex = rows.findIndex((r, i) => i > 0 && r[0] === hn)
+  if (rowIndex === -1) return   // already gone — idempotent
+
+  const sheetId = await getNumericSheetId('Patients')
+  const sheets = getSheets()
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SHEET_ID(),
+    requestBody: {
+      requests: [{
+        deleteDimension: {
+          range: { sheetId, dimension: 'ROWS', startIndex: rowIndex, endIndex: rowIndex + 1 },
+        },
+      }],
+    },
+  })
+}
+
+export async function getPatientHistory(limit = 100): Promise<PatientHistoryRow[]> {
+  const rows = await getSheetValues('PatientHistory')
+  return rows
+    .slice(1)
+    .map(rowToHistory)
+    .filter(r => r.hn)
+    .reverse()          // newest first
+    .slice(0, limit)
+}
+
