@@ -1,10 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getClinics, upsertClinic, deleteClinic } from '@/lib/sheets'
+import { invalidateClinics } from '@/lib/cache'
 import { Clinic } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  // Pass ?nocache=1 to force a fresh fetch (bypasses 5-min in-process cache)
+  if (req.nextUrl.searchParams.get('nocache') === '1') {
+    invalidateClinics()
+  }
   const clinics = await getClinics()
   return NextResponse.json(clinics)
 }

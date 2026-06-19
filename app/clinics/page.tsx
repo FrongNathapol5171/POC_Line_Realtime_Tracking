@@ -21,7 +21,12 @@ export default function ClinicsPage() {
   const [modal, setModal] = useState<ModalState | null>(null)
   const [toast, setToast] = useState<ToastState | null>(null)
 
-  async function load() { const r = await fetch('/api/clinics'); setClinics(await r.json()) }
+  async function load() {
+    // nocache=1 bypasses the 5-min in-process cache so changes from the
+    // sheet (manual edits, deletes) appear immediately
+    const r = await fetch('/api/clinics?nocache=1')
+    setClinics(await r.json())
+  }
   useEffect(() => { load() }, [])
 
   function showToast(type: ToastType, msg: string) { setToast({ type, message: msg, key: Date.now() }) }

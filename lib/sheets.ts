@@ -247,18 +247,32 @@ export async function upsertClinic(clinic: Clinic): Promise<void> {
 
 export async function deleteClinic(clinicId: string): Promise<void> {
   if (clinicId === 'BILLING') throw new Error('Cannot delete BILLING clinic')
-  const sheets = getSheets()
+
+  // Always clear the cache first so the next getClinics() call re-fetches from Sheets
+  invalidateClinics()
+
   const rows = await getSheetValues('Clinics')
-  for (let i = 1; i < rows.length; i++) {
-    if (rows[i][0] === clinicId) {
-      // Mark inactive instead of deleting rows (simpler for Sheets)
-      const clinic = rowToClinic(rows[i])
-      clinic.active = false
-      await updateRow('Clinics', i + 1, clinicToRow(clinic))
-      return
-    }
-  }
-  void sheets // keep import used
+  const rowIndex = rows.findIndex((r, i) => i > 0 && r[0] === clinicId)
+  if (rowIndex === -1) return   // already gone — idempotent
+
+  // Actually delete the row (not just mark inactive)
+  const sheetId = await getNumericSheetId('Clinics')
+  const sheets = getSheets()
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SHEET_ID(),
+    requestBody: {
+      requests: [{
+        deleteDimension: {
+          range: {
+            sheetId,
+            dimension: 'ROWS',
+            startIndex: rowIndex,       // 0-based; rowIndex from findIndex is correct
+            endIndex: rowIndex + 1,
+          },
+        },
+      }],
+    },
+  })
 }
 
 // ---------------------------------------------------------------------------
